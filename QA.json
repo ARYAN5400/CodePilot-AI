@@ -1,0 +1,45 @@
+{
+  "checkedAt": "2026-11-13T16:53:28.925Z",
+  "productionBuild": "passed",
+  "backendSyntax": "passed",
+  "backendUnitTests": "5 passed",
+  "testedViewportWidths": [
+    320,
+    390,
+    768,
+    1024,
+    1536
+  ],
+  "horizontalOverflow": "none detected",
+  "internalAnchorTargets": "all resolved",
+  "mobileMenu": "opens, navigates, closes",
+  "cta": "opens demo disclosure and launches sample agent workflow",
+  "workspaceTabs": [
+    "Activity",
+    "Proposed patch",
+    "Test results"
+  ],
+  "limitations": [
+    "No production authentication",
+    "No GitHub OAuth or repository access",
+    "No AI execution or Docker test backend",
+    "Privacy and terms are demo notices, not production legal policies",
+    "Google Fonts requested from Google; system fonts used as fallback",
+    "No official contact address configured"
+  ],
+  "websiteAudience": "Students learning software development",
+  "backend": {
+    "scope": "GitHub App OAuth scaffold with state + PKCE, encrypted expiring sessions, read-only repository list",
+    "syntax": "passed",
+    "unitTests": "5 passed",
+    "production": "not configured; no credentials, MongoDB, API hosting, or frontend connection"
+  },
+  "websiteTheme": "Dark, warm, student-focused",
+  "deployment": {
+    "frontendStatus": "Ready",
+    "frontendUrl": "https://codepilot-ai-wheat.vercel.app",
+    "method": "Vercel direct static-file deployment",
+    "gitAutoDeploy": "not connected",
+    "backend": "not deployed"
+  }
+}
