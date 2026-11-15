@@ -89,3 +89,88 @@ test('handler rate limit includes retry-after and skips provider', async () => {
   assert.equal((await invoke({ handler })).status, 200); const rejected = await invoke({ handler });
   assert.equal(rejected.status, 429); assert.ok(Number(rejected.headers['Retry-After']) > 0); assert.equal(calls, 1);
 });
+
+test('Gemini responseSchema uses only supported OpenAPI-style fields', async () => {
+  let config;
+  await invoke({ handler: createHandler({ env: { GEMINI_API_KEY: 'key' }, fetchImpl: async (_, options) => { config = JSON.parse(options.body).generationConfig; return provider(); } }) });
+  const schema = config.responseSchema;
+  assert.equal(schema.type, 'OBJECT'); assert.equal(Object.hasOwn(schema, 'additionalProperties'), false);
+  assert.deepEqual(schema.propertyOrdering, ['summary', 'rootCause', 'fixedCode', 'explanation', 'suggestedTests', 'verification']);
+  assert.deepEqual(schema.required, schema.propertyOrdering);
+  assert.deepEqual(schema.properties.verification.enum, ['not_run']);
+  assert.deepEqual(Object.keys(schema).sort(), ['type', 'properties', 'required', 'propertyOrdering'].sort());
+});
+test('UTF-8 request byte boundary applies equally to object, string, Buffer and stream', async () => {
+  const value = { ...input, code: '界'.repeat(15900) };
+  const overhead = Buffer.byteLength(JSON.stringify(value)) - Buffer.byteLength(value.code);
+  value.code += 'a'.repeat(LIMITS.bodyBytes - overhead - Buffer.byteLength(value.code));
+  const raw = JSON.stringify(value); assert.equal(Buffer.byteLength(raw), LIMITS.bodyBytes);
+  for (const body of [value, raw, Buffer.from(raw)]) assert.equal((await invoke({ body })).status, 200);
+  const bytes = Buffer.from(raw);
+  assert.equal((await invoke({ stream: [bytes.subarray(0, 52), bytes.subarray(52)] })).status, 200);
+  for (const body of [{ ...value, code: value.code + 'a' }, raw + ' ', Buffer.from(raw + ' ')]) assert.equal((await invoke({ body })).status, 413);
+  assert.equal((await invoke({ stream: [bytes, Buffer.from(' ')] })).status, 413);
+});
+test('malformed raw UTF-8 is rejected instead of silently replacing source characters', async () => {
+  const invalid = Buffer.concat([Buffer.from('{"language":"javascript","code":"'), Buffer.from([0xc3, 0x28]), Buffer.from('","issue":"fix"}')]);
+  for (const request of [{ body: invalid }, { stream: [invalid] }]) {
+    const result = await invoke(request); assert.equal(result.status, 400); assert.equal(result.body.error.code, 'invalid_request');
+  }
+});
+test('request stream failure is a client-body error, not provider failure', async () => {
+  const stream = Readable.from((async function* () { yield Buffer.from('{'); throw new Error('private socket failure'); })());
+  const result = await invoke({ stream }); assert.equal(result.status, 400); assert.equal(result.body.error.code, 'invalid_request');
+  assert.ok(!JSON.stringify(result.body).includes('socket'));
+});
+test('provider text split into multiple parts is joined without accepting tool calls', async () => {
+  const json = JSON.stringify(output);
+  const fetchFor = parts => async () => new Response(JSON.stringify({ candidates: [{ finishReason: 'STOP', content: { parts } }] }));
+  const handlerFor = parts => createHandler({ env: { GEMINI_API_KEY: 'key' }, fetchImpl: fetchFor(parts) });
+  const result = await invoke({ handler: handlerFor([{ text: json.slice(0, 20) }, { text: json.slice(20) }]) });
+  assert.equal(result.status, 200); assert.deepEqual(result.body, output);
+  for (const parts of [[{ text: json, functionCall: { name: 'run' } }], [{ text: json, thought: true }], [], [{ text: json, alien: true }]]) {
+    const badResult = await invoke({ handler: handlerFor(parts) }); assert.equal(badResult.status, 502); assert.equal(badResult.body.error.code, 'invalid_provider_response');
+  }
+});
+test('malformed provider UTF-8 fails strict decoding', async () => {
+  const valid = JSON.stringify({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify(output) }] } }] });
+  const bytes = Buffer.from(valid.replace('Review', 'X')); const offset = bytes.indexOf(Buffer.from('X')); bytes[offset] = 0xff;
+  const result = await invoke({ handler: createHandler({ env: { GEMINI_API_KEY: 'key' }, fetchImpl: async () => new Response(bytes) }) });
+  assert.equal(result.status, 502); assert.equal(result.body.error.code, 'invalid_provider_response');
+});
+test('timeout aborts fetch with a stable 504 error contract', async () => {
+  let signal;
+  const fetchImpl = async (_, options) => { signal = options.signal; return new Promise((_, reject) => signal.addEventListener('abort', () => reject(new DOMException('private abort detail', 'AbortError')), { once: true })); };
+  const result = await invoke({ handler: createHandler({ env: { GEMINI_API_KEY: 'key' }, fetchImpl, timeoutMs: 10 }) });
+  assert.equal(signal.aborted, true); assert.equal(result.status, 504); assert.equal(result.body.error.code, 'provider_timeout');
+  assert.ok(!JSON.stringify(result.body).includes('private'));
+});
+test('timeout cancels the provider reader, including when cancel itself never settles', async () => {
+  let cancelled = false;
+  const fetchImpl = async () => new Response(new ReadableStream({ start() {}, cancel() { cancelled = true; return new Promise(() => {}); } }));
+  const result = await invoke({ handler: createHandler({ env: { GEMINI_API_KEY: 'key' }, fetchImpl, timeoutMs: 10 }) });
+  assert.equal(result.status, 504); assert.equal(cancelled, true);
+});
+test('provider throttling returns promptly even if provider body cancellation hangs', async () => {
+  let cancelled = false;
+  const fetchImpl = async () => new Response(new ReadableStream({ cancel() { cancelled = true; return new Promise(() => {}); } }), { status: 429 });
+  const result = await invoke({ handler: createHandler({ env: { GEMINI_API_KEY: 'key' }, fetchImpl, timeoutMs: 100 }) });
+  assert.equal(result.status, 503); assert.equal(result.body.error.code, 'provider_busy'); assert.equal(cancelled, true);
+});
+test('network failure differs from malformed provider response without exposing details', async () => {
+  const result = await invoke({ handler: createHandler({ env: { GEMINI_API_KEY: 'key' }, fetchImpl: async () => { throw new Error('private network detail'); } }) });
+  assert.equal(result.status, 502); assert.equal(result.body.error.code, 'provider_error');
+  assert.deepEqual(Object.keys(result.body), ['error']); assert.deepEqual(Object.keys(result.body.error).sort(), ['code', 'message']);
+  assert.ok(!JSON.stringify(result.body).includes('private'));
+});
+test('preparsed-body wire content-length still enforces original UTF-8 byte size', async () => {
+  const result = await invoke({ body: input, headers: { 'content-length': String(LIMITS.bodyBytes + 1) } });
+  assert.equal(result.status, 413);
+  for (const value of [[], ['1'], '-1', '1.2', 'not-a-size']) assert.equal((await invoke({ headers: { 'content-length': value } })).status, 413);
+});
+test('invalid environment values fail closed without calling provider', async () => {
+  for (const env of [{ GEMINI_API_KEY: 1 }, { GEMINI_API_KEY: 'key', GEMINI_MODEL: {} }]) {
+    const result = await invoke({ handler: createHandler({ env, fetchImpl: () => { assert.fail('Provider must not run'); } }) });
+    assert.equal(result.status, 503); assert.equal(result.body.error.code, 'not_configured');
+  }
+});
