@@ -52,43 +52,61 @@ async function readInput(req) {
   const encoding = req.headers['content-encoding'];
   if (encoding && encoding !== 'identity') throw new ApiError(415, 'unsupported_encoding', 'Compressed bodies are not supported.');
   const length = req.headers['content-length'];
-  if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > LIMITS.bodyBytes)) throw new ApiError(413, 'body_too_large', 'Request body is too large.');
+  if (length !== undefined && (typeof length !== 'string' || !/^\d+$/.test(length) || Number(length) > LIMITS.bodyBytes)) throw new ApiError(413, 'body_too_large', 'Request body is too large.');
   let body = req.body;
   if (body !== undefined) {
     let serialized;
     try { serialized = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body); } catch { throw bad('Invalid JSON.'); }
     if (serialized === undefined) throw bad('Invalid JSON.');
     if (Buffer.byteLength(serialized) > LIMITS.bodyBytes) throw new ApiError(413, 'body_too_large', 'Request body is too large.');
-    if (typeof body === 'string' || Buffer.isBuffer(body)) { try { body = JSON.parse(body.toString()); } catch { throw bad('Invalid JSON.'); } }
+    if (typeof body === 'string' || Buffer.isBuffer(body)) { try { body = JSON.parse(Buffer.isBuffer(body) ? new TextDecoder('utf-8', { fatal: true }).decode(body) : body); } catch { throw bad('Invalid JSON or UTF-8.'); } }
   } else {
     const chunks = []; let size = 0;
-    for await (const chunk of req) { const buffer = Buffer.from(chunk); size += buffer.length; if (size > LIMITS.bodyBytes) throw new ApiError(413, 'body_too_large', 'Request body is too large.'); chunks.push(buffer); }
-    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw bad('Invalid JSON.'); }
+    try {
+      for await (const chunk of req) { const buffer = Buffer.from(chunk); size += buffer.length; if (size > LIMITS.bodyBytes) throw new ApiError(413, 'body_too_large', 'Request body is too large.'); chunks.push(buffer); }
+    } catch (error) { if (error instanceof ApiError) throw error; throw bad('Could not read the request body.'); }
+    try { body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))); } catch { throw bad('Invalid JSON or UTF-8.'); }
   }
   return validateInput(body);
 }
 const schema = {
-  type: 'OBJECT', additionalProperties: false,
+  // Gemini responseSchema uses its OpenAPI-style Schema, not arbitrary JSON Schema.
+  // additionalProperties is unsupported here; exact keys are enforced locally.
+  type: 'OBJECT', propertyOrdering: OUTPUT_KEYS,
   properties: {
     summary: { type: 'STRING' }, rootCause: { type: 'STRING' }, fixedCode: { type: 'STRING' },
     explanation: { type: 'ARRAY', items: { type: 'STRING' } }, suggestedTests: { type: 'ARRAY', items: { type: 'STRING' } },
     verification: { type: 'STRING', enum: ['not_run'] }
   }, required: OUTPUT_KEYS
 };
-async function boundedJson(response) {
+// Do not await cancellation: a misbehaving stream must not delay an error/deadline.
+function cancelBody(body) { try { Promise.resolve(body?.cancel()).catch(() => {}); } catch {} }
+async function boundedJson(response, signal) {
   if (!response.body) throw new Error('No provider body');
   const reader = response.body.getReader(); const chunks = []; let size = 0;
+  const cancel = () => { try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {} };
+  signal.addEventListener('abort', cancel, { once: true });
   try {
-    while (true) { const { done, value } = await reader.read(); if (done) break; size += value.byteLength; if (size > LIMITS.providerBytes) { await reader.cancel(); throw new Error('Provider body too large'); } chunks.push(Buffer.from(value)); }
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  } finally { reader.releaseLock(); }
+    if (signal.aborted) { cancel(); throw new Error('Aborted'); }
+    const length = response.headers.get('content-length');
+    if (length && /^\d+$/.test(length) && Number(length) > LIMITS.providerBytes) { cancel(); throw new Error('Provider body too large'); }
+    while (true) {
+      const { done, value } = await reader.read();
+      if (signal.aborted) throw new Error('Aborted');
+      if (done) break;
+      size += value.byteLength;
+      if (size > LIMITS.providerBytes) { cancel(); throw new Error('Provider body too large'); }
+      chunks.push(Buffer.from(value));
+    }
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+  } finally { signal.removeEventListener('abort', cancel); reader.releaseLock(); }
 }
 export function createHandler({ fetchImpl = globalThis.fetch, env = process.env, limiter = createRateLimiter(), timeoutMs = LIMITS.timeoutMs } = {}) {
   return async function handler(req, res) {
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Vary', 'Origin, Sec-Fetch-Site');
     const send = (status, body) => { res.statusCode = status; res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify(body)); };
-    let timer;
+    let timer, timedOut = false;
     try {
       if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); throw new ApiError(405, 'method_not_allowed', 'Use POST.'); }
       checkOrigin(req);
@@ -97,12 +115,13 @@ export function createHandler({ fetchImpl = globalThis.fetch, env = process.env,
       const retry = limiter(identity);
       if (retry) { res.setHeader('Retry-After', String(retry)); throw new ApiError(429, 'rate_limited', 'Too many requests. Try again later.'); }
       const input = await readInput(req);
-      const key = env.GEMINI_API_KEY?.trim();
-      const model = env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash';
-      if (!key || !/^[a-zA-Z0-9._-]{1,100}$/.test(model)) throw new ApiError(503, 'not_configured', 'The debugging service is not configured.');
+      const key = typeof env.GEMINI_API_KEY === 'string' ? env.GEMINI_API_KEY.trim() : '';
+      const model = typeof env.GEMINI_MODEL === 'string' ? env.GEMINI_MODEL.trim() || 'gemini-2.5-flash' : 'gemini-2.5-flash';
+      if (!key || (env.GEMINI_MODEL !== undefined && typeof env.GEMINI_MODEL !== 'string') || !/^[a-zA-Z0-9._-]{1,100}$/.test(model)) throw new ApiError(503, 'not_configured', 'The debugging service is not configured.');
       const controller = new AbortController();
       const work = async () => {
-        const response = await fetchImpl('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+        let response;
+        try { response = await fetchImpl('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
           method: 'POST', signal: controller.signal,
           headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
           body: JSON.stringify({
@@ -110,20 +129,24 @@ export function createHandler({ fetchImpl = globalThis.fetch, env = process.env,
             contents: [{ role: 'user', parts: [{ text: JSON.stringify(input) }] }],
             generationConfig: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.2, maxOutputTokens: 16384 }
           })
-        });
-        if (!response.ok) { try { await response.body?.cancel(); } catch {} throw new ApiError(response.status === 429 ? 503 : 502, response.status === 429 ? 'provider_busy' : 'provider_error', response.status === 429 ? 'AI service is busy. Try again later.' : 'AI service could not complete the request.'); }
-        const data = await boundedJson(response);
-        if (!Array.isArray(data.candidates) || data.candidates.length !== 1 || data.candidates[0].finishReason !== 'STOP') throw new Error('Incomplete provider result');
-        const parts = data.candidates[0].content?.parts;
-        if (!Array.isArray(parts) || parts.length !== 1 || typeof parts[0].text !== 'string') throw new Error('Invalid provider content');
-        return validateOutput(JSON.parse(parts[0].text));
+        }); } catch { throw new ApiError(502, 'provider_error', 'AI service could not be reached. Try again.'); }
+        if (!response.ok) { cancelBody(response.body); throw new ApiError(response.status === 429 ? 503 : 502, response.status === 429 ? 'provider_busy' : 'provider_error', response.status === 429 ? 'AI service is busy. Try again later.' : 'AI service could not complete the request.'); }
+        try {
+          const data = await boundedJson(response, controller.signal);
+          if (!Array.isArray(data.candidates) || data.candidates.length !== 1 || data.candidates[0].finishReason !== 'STOP') throw new Error('Incomplete provider result');
+          const parts = data.candidates[0].content?.parts;
+          // Text may be split across parts. Never interpret tool calls or reasoning as output.
+          if (!Array.isArray(parts) || parts.length === 0 || !parts.every(part => plain(part) && typeof part.text === 'string' && !part.thought && Object.keys(part).every(k => ['text', 'thought', 'thoughtSignature'].includes(k)))) throw new Error('Invalid provider content');
+          return validateOutput(JSON.parse(parts.map(part => part.text).join('')));
+        } catch { throw new ApiError(502, 'invalid_provider_response', 'AI service returned an unusable response. Try again.'); }
       };
-      const timeout = new Promise((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new ApiError(504, 'provider_timeout', 'AI service timed out. Try again.')); }, timeoutMs); });
+      const timeout = new Promise((_, reject) => { timer = setTimeout(() => { timedOut = true; reject(new ApiError(504, 'provider_timeout', 'AI service timed out. Try again.')); controller.abort(); }, timeoutMs); });
       const result = await Promise.race([work(), timeout]);
       send(200, result);
     } catch (error) {
       // Deliberately do not log request source, provider bodies, credentials, or raw errors.
-      send(error instanceof ApiError ? error.status : 502, { error: { code: error instanceof ApiError ? error.code : 'invalid_provider_response', message: error instanceof ApiError ? error.message : 'AI service returned an unusable response. Try again.' } });
+      const failure = timedOut ? new ApiError(504, 'provider_timeout', 'AI service timed out. Try again.') : error instanceof ApiError ? error : new ApiError(500, 'internal_error', 'The debugging service encountered an error. Try again.');
+      send(failure.status, { error: { code: failure.code, message: failure.message } });
     } finally { if (timer) clearTimeout(timer); }
   };
 }
