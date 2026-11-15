@@ -1,3 +1,7 @@
+## Student debugging workspace update
+
+Open `/#workspace` for code input, file import, prepared practice examples, AI explanations, before/after code review, and fix downloads. The new `/api/debug` Vercel function needs a server-only Gemini API key. See [DEBUGGING_SETUP.md](DEBUGGING_SETUP.md). No submitted code is executed. The landing page agent animation and dashboard remain illustrative.
+
 # CodePilot AI
 
 Live frontend: https://codepilot-ai-wheat.vercel.app (static Vercel Drop; Git auto-deploy is not connected).
@@ -21,7 +25,7 @@ See [`backend/README.md`](backend/README.md) and [`BACKEND_PLAN.md`](BACKEND_PLA
 
 ## Current status
 
-This is a frontend preview and backend starter, not a live AI engineering service. There is no active authentication, GitHub connection, Gemini integration, source-code processing, code execution, Docker test runner, account UI, or production API deployment. Dashboard numbers, repository names, patches, and test results are illustrative. No change is made to a repository by this demo.
+This is a frontend preview and backend starter, not a live AI engineering service. Authentication, GitHub connection, code execution, Docker test runner, and account UI remain unconnected. This branch adds a source-analysis workspace and a Gemini-backed API that requires server-side configuration and deployment. Dashboard numbers, repository names, patches, and test results are illustrative. No change is made to a repository by this demo.
 
 ## Safety notes
 
